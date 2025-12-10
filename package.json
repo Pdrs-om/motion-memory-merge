@@ -1,14 +1,12 @@
 {
   "name": "motion-memory-merge",
   "version": "1.0.0",
-  "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "node-fetch": "^3.3.2",
-    "@supabase/supabase-js": "^2.48.0"
+    "cors": "^2.8.5"
   }
 }
