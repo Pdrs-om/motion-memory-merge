@@ -1,41 +1,52 @@
-import express from "express";
+const express = require("express");
+const cors = require("cors");
 
 const app = express();
-const port = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
-// Pour lire du JSON dans les requêtes
-app.use(express.json());
+// CORS pour autoriser l'appel depuis ton front (Lovable / motion-memory.com)
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
 
-// Healthcheck simple pour Railway
-app.get("/", (req, res) => {
-  res.json({ status: "ok", service: "motion-memory-merge" });
+// Pour accepter un body JSON assez gros (URLs, plus tard config FFmpeg)
+app.use(express.json({ limit: "200mb" }));
+
+// Petite route de santé pour tester dans le navigateur
+app.get("/health", (req, res) => {
+  res.json({ ok: true, service: "motion-memory-merge" });
 });
 
-// Endpoint de merge (squelette, à compléter ensuite)
+// Réponse au preflight CORS (OPTIONS /merge)
+app.options("/merge", (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+  res.status(204).send();
+});
+
+// Endpoint de fusion (pour l'instant : stub de test)
 app.post("/merge", async (req, res) => {
-  try {
-    const { videoUrls } = req.body;
+  const { videoUrls, audioUrl } = req.body || {};
+  console.log("[/merge] request body", { videoUrls, audioUrl });
 
-    if (!Array.isArray(videoUrls) || videoUrls.length < 2) {
-      return res.status(400).json({
-        error: "Il faut fournir au moins 2 URLs de vidéos dans videoUrls[]",
-      });
-    }
-
-    // TODO: ici on implémentera la vraie logique ffmpeg côté serveur.
-    // Pour l’instant, on renvoie juste ce qu’on a reçu, pour tester le pipeline.
-    return res.json({
-      ok: true,
-      received: videoUrls,
-      message:
-        "API merge en place. La logique ffmpeg sera branchée dans un second temps.",
-    });
-  } catch (err) {
-    console.error("[merge] Error:", err);
-    return res.status(500).json({ error: "Erreur interne serveur" });
+  if (!Array.isArray(videoUrls) || videoUrls.length === 0) {
+    return res.status(400).json({ error: "videoUrls array is required" });
   }
+
+  // TODO: ici on branchera la vraie fusion FFmpeg.
+  // Pour le moment on renvoie juste un JSON pour vérifier que l'appel passe.
+  return res.json({
+    ok: true,
+    message: "Backend reachable, CORS OK. Fusion à implémenter.",
+    videoCount: videoUrls.length,
+  });
 });
 
-app.listen(port, () => {
-  console.log(`Merge service listening on port ${port}`);
+app.listen(PORT, () => {
+  console.log(`motion-memory-merge listening on port ${PORT}`);
 });
