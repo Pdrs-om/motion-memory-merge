@@ -1,19 +1,17 @@
 FROM node:20-slim
 
-# Dossier de travail dans le container
+# Dossier de travail
 WORKDIR /app
 
-# Copier les fichiers de configuration npm
+# Installer les dépendances Node
 COPY package*.json ./
+RUN npm install
 
-# Installer les dépendances
-RUN npm install --omit=dev
+# Installer ffmpeg dans le container
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
-# Copier le reste du code
+# Copier le code
 COPY . .
 
-# Port exposé par le serveur Node
-EXPOSE 3000
-
-# Commande de démarrage
+# Lancer le serveur
 CMD ["npm", "start"]
