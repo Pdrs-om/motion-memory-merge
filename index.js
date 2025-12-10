@@ -1,10 +1,14 @@
 const express = require("express");
 const cors = require("cors");
-const fs = require("fs/promises");
 const { execFile } = require("child_process");
-const { promisify } = require("util");
+const util = require("util");
+const fs = require("fs").promises;
+const fsSync = require("fs");
+const path = require("path");
+const http = require("http");
+const https = require("https");
 
-const execFileAsync = promisify(execFile);
+const execFileAsync = util.promisify(execFile);
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -18,7 +22,7 @@ app.use(
   })
 );
 
-// Pour accepter un body JSON assez gros (URLs, plus tard config audio)
+// Pour accepter un body JSON assez gros (URLs, plus tard config FFmpeg)
 app.use(express.json({ limit: "200mb" }));
 
 // Petite route de santé pour tester dans le navigateur
@@ -34,22 +38,110 @@ app.options("/merge", (req, res) => {
   res.status(204).send();
 });
 
-// Helper : téléchargement d'une vidéo dans /tmp
-async function downloadToTmp(url, index) {
-  console.log(`[downloadToTmp] downloading #${index} from`, url);
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Download failed for ${url} with status ${response.status}`);
-  }
-  const arrayBuffer = await response.arrayBuffer();
-  const filePath = `/tmp/input_${index}.mp4`;
-  await fs.writeFile(filePath, Buffer.from(arrayBuffer));
-  return filePath;
+/**
+ * Télécharge une vidéo à partir d'une URL (Supabase signed URL)
+ * et la sauvegarde dans /tmp/input_X.mp4
+ */
+async function downloadToTmp(fileUrl, index) {
+  return new Promise((resolve, reject) => {
+    try {
+      const urlObj = new URL(fileUrl);
+      const client = urlObj.protocol === "https:" ? https : http;
+      const tmpPath = `/tmp/input_${index}.mp4`;
+      const fileStream = fsSync.createWriteStream(tmpPath);
+
+      const req = client.get(urlObj, (response) => {
+        if (response.statusCode !== 200) {
+          return reject(
+            new Error(`Download failed (${response.statusCode}) for ${fileUrl}`)
+          );
+        }
+        response.pipe(fileStream);
+        fileStream.on("finish", () => {
+          fileStream.close(() => resolve(tmpPath));
+        });
+      });
+
+      req.on("error", (err) => {
+        reject(err);
+      });
+    } catch (err) {
+      reject(err);
+    }
+  });
 }
 
-// Helper : concaténation avec ffmpeg
+/**
+ * Lit la taille (width/height) de la vidéo avec ffprobe
+ */
+async function getVideoSize(inputPath) {
+  const args = [
+    "-v",
+    "error",
+    "-select_streams",
+    "v:0",
+    "-show_entries",
+    "stream=width,height",
+    "-of",
+    "json",
+    inputPath,
+  ];
+
+  const { stdout } = await execFileAsync("ffprobe", args);
+  const info = JSON.parse(stdout);
+  const stream = info.streams && info.streams[0];
+  if (!stream || !stream.width || !stream.height) {
+    throw new Error(`Unable to read video size for ${inputPath}`);
+  }
+  return { width: stream.width, height: stream.height };
+}
+
+/**
+ * Normalise UNE vidéo dans un format cible (targetW x targetH)
+ * en conservant le ratio d'origine : scale + pad (bandes noires).
+ */
+async function normalizeVideo(inputPath, index, targetW, targetH) {
+  const normalizedPath = `/tmp/norm_${index}.mp4`;
+
+  const filter = [
+    // Redimensionne au max dans le cadre sans déformer
+    `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease`,
+    // Centre dans un canvas fixe, ajoute des bandes noires si besoin
+    `pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:black`,
+    // Fixe le sample aspect ratio
+    "setsar=1",
+  ].join(",");
+
+  const args = [
+    "-y",
+    "-i",
+    inputPath,
+    "-vf",
+    filter,
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "23",
+    "-an", // pas d'audio pour l'instant
+    normalizedPath,
+  ];
+
+  console.log("[ffmpeg normalize] running:", ["ffmpeg", ...args].join(" "));
+
+  const { stdout, stderr } = await execFileAsync("ffmpeg", args);
+  if (stdout) console.log("[ffmpeg normalize stdout]", stdout);
+  if (stderr) console.log("[ffmpeg normalize stderr]", stderr);
+
+  return normalizedPath;
+}
+
+/**
+ * Concatène toutes les vidéos normalisées (mêmes dimensions)
+ * en un seul fichier MP4.
+ */
 async function concatVideos(inputPaths, outputPath) {
-  // Crée le fichier de concat pour ffmpeg
   const concatList = inputPaths.map((p) => `file '${p}'`).join("\n");
   const concatFile = "/tmp/inputs.txt";
   await fs.writeFile(concatFile, concatList);
@@ -62,8 +154,6 @@ async function concatVideos(inputPaths, outputPath) {
     "0",
     "-i",
     concatFile,
-    "-vf",
-    "scale=1280:-2,format=yuv420p",
     "-c:v",
     "libx264",
     "-preset",
@@ -75,14 +165,20 @@ async function concatVideos(inputPaths, outputPath) {
     outputPath,
   ];
 
-  console.log("[ffmpeg] running:", ["ffmpeg", ...args].join(" "));
+  console.log("[ffmpeg concat] running:", ["ffmpeg", ...args].join(" "));
 
   const { stdout, stderr } = await execFileAsync("ffmpeg", args);
-  if (stdout) console.log("[ffmpeg stdout]", stdout);
-  if (stderr) console.log("[ffmpeg stderr]", stderr);
+  if (stdout) console.log("[ffmpeg concat stdout]", stdout);
+  if (stderr) console.log("[ffmpeg concat stderr]", stderr);
 }
 
-// Endpoint de fusion
+/**
+ * Endpoint de fusion
+ * Règle de format :
+ *  - On regarde la première vidéo
+ *  - si width >= height → sortie 1920x1080 (paysage)
+ *  - sinon → sortie 1080x1920 (portrait)
+ */
 app.post("/merge", async (req, res) => {
   const { videoUrls, audioUrl } = req.body || {};
   console.log("[/merge] request body", { videoUrls, audioUrl });
@@ -93,17 +189,37 @@ app.post("/merge", async (req, res) => {
 
   try {
     // 1. Télécharger toutes les vidéos dans /tmp
-    const inputPaths = [];
+    const rawPaths = [];
     for (let i = 0; i < videoUrls.length; i++) {
       const p = await downloadToTmp(videoUrls[i], i);
-      inputPaths.push(p);
+      rawPaths.push(p);
     }
 
-    // 2. Lancer ffmpeg pour concaténer
-    const outputPath = "/tmp/output.mp4";
-    await concatVideos(inputPaths, outputPath);
+    // 2. Déterminer le format de sortie à partir de la première vidéo
+    const firstSize = await getVideoSize(rawPaths[0]);
+    const isLandscape = firstSize.width >= firstSize.height;
 
-    // 3. Lire le fichier résultant et le renvoyer
+    const targetW = isLandscape ? 1920 : 1080;
+    const targetH = isLandscape ? 1080 : 1920;
+
+    console.log(
+      "[/merge] target format",
+      isLandscape ? "landscape" : "portrait",
+      `${targetW}x${targetH}`
+    );
+
+    // 3. Normaliser chaque vidéo vers ce format
+    const normalizedPaths = [];
+    for (let i = 0; i < rawPaths.length; i++) {
+      const norm = await normalizeVideo(rawPaths[i], i, targetW, targetH);
+      normalizedPaths.push(norm);
+    }
+
+    // 4. Concaténer les vidéos normalisées
+    const outputPath = "/tmp/output.mp4";
+    await concatVideos(normalizedPaths, outputPath);
+
+    // 5. Lire le fichier résultant et le renvoyer
     const buffer = await fs.readFile(outputPath);
     res.setHeader("Content-Type", "video/mp4");
     res.send(buffer);
