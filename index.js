@@ -4,7 +4,6 @@ const { execFile } = require("child_process");
 const util = require("util");
 const fs = require("fs").promises;
 const fsSync = require("fs");
-const path = require("path");
 const http = require("http");
 const https = require("https");
 
@@ -99,6 +98,7 @@ async function getVideoSize(inputPath) {
 /**
  * Normalise UNE vidéo dans un format cible (targetW x targetH)
  * en conservant le ratio d'origine : scale + pad (bandes noires).
+ * On corrige aussi les timestamps problématiques des vidéos générées (Veo, etc.)
  */
 async function normalizeVideo(inputPath, index, targetW, targetH) {
   const normalizedPath = `/tmp/norm_${index}.mp4`;
@@ -108,16 +108,18 @@ async function normalizeVideo(inputPath, index, targetW, targetH) {
     `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease`,
     // Centre dans un canvas fixe, ajoute des bandes noires si besoin
     `pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:black`,
-    // Fixe le sample aspect ratio
-    "setsar=1",
   ].join(",");
 
   const args = [
     "-y",
+    "-fflags",
+    "+genpts", // régénère les timestamps
     "-i",
     inputPath,
     "-vf",
     filter,
+    "-vsync",
+    "cfr", // framerate constant pour éviter les timecodes bizarres
     "-c:v",
     "libx264",
     "-preset",
@@ -176,8 +178,8 @@ async function concatVideos(inputPaths, outputPath) {
  * Endpoint de fusion
  * Règle de format :
  *  - On regarde la première vidéo
- *  - si width >= height → sortie 1920x1080 (paysage)
- *  - sinon → sortie 1080x1920 (portrait)
+ *  - si width >= height → sortie 1280x720 (paysage)
+ *  - sinon → sortie 720x1280 (portrait)
  */
 app.post("/merge", async (req, res) => {
   const { videoUrls, audioUrl } = req.body || {};
@@ -199,8 +201,9 @@ app.post("/merge", async (req, res) => {
     const firstSize = await getVideoSize(rawPaths[0]);
     const isLandscape = firstSize.width >= firstSize.height;
 
-    const targetW = isLandscape ? 1920 : 1080;
-    const targetH = isLandscape ? 1080 : 1920;
+    // on reste en 720p natif pour éviter l'upscale et limiter la charge
+    const targetW = isLandscape ? 1280 : 720;
+    const targetH = isLandscape ? 720 : 1280;
 
     console.log(
       "[/merge] target format",
